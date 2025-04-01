@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MacGregor Crane Simulator v5.2 (Swing Physics)</title>
+    <style>
+        /* CSS remains the same */
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background-color: #f0f0f0; }
+        #craneCanvas { display: block; }
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.75);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-width: 250px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+        }
+        #ui > div, #ui > button, #ui > label { margin-bottom: 5px; }
+        #ui h3 { margin: 0 0 10px 0; padding-bottom: 5px; border-bottom: 1px solid #666; font-size: 1.1em; }
+        #controlsInfo, #gameInfo, #highScoresContainer, #craneSelection { background-color: rgba(255, 255, 255, 0.1); padding: 12px; border-radius: 5px; }
+        #highScoresList { list-style: none; padding: 0; margin: 0; }
+        #highScoresList li { margin-bottom: 4px; font-size: 0.95em; }
+        #startButton { padding: 12px 18px; font-size: 1.05em; cursor: pointer; background-color: #4CAF50; color: white; border: none; border-radius: 5px; margin-top: 10px; transition: background-color 0.2s ease; }
+        #startButton:hover:not(:disabled) { background-color: #45a049; }
+        #startButton:disabled { background-color: #aaa; cursor: not-allowed; }
+        #craneSelect { padding: 8px; border-radius: 4px; border: 1px solid #ccc; background-color: #fff; color: #333; width: 100%; box-sizing: border-box; }
+        label[for="craneSelect"] { display: block; margin-bottom: 5px; font-weight: bold; }
+        #gameOverMessage { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background-color: rgba(200, 0, 0, 0.85); color: white; padding: 35px; border-radius: 10px; font-size: 2.2em; text-align: center; display: none; z-index: 10; box-shadow: 0 4px 10px rgba(0,0,0,0.4); }
+        #gameOverMessage span { display: block; margin-top: 10px; font-weight: bold; }
+        #timerBarContainer { width: 100%; height: 15px; background-color: #555; border: 1px solid #888; border-radius: 3px; overflow: hidden; margin-top: 5px; }
+        #timerBar { width: 100%; height: 100%; background-color: #4CAF50; transition: width 0.5s linear, background-color 0.5s linear; border-radius: 2px; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div id="craneSelection">
+            <label for="craneSelect">Select Crane:</label>
+            <select id="craneSelect">
+                <option value="standard">Standard (Yellow)</option>
+                <option value="heavy">Heavy Duty (Red)</option>
+                <option value="subsea">Subsea AHC (Blue/White)</option>
+            </select>
+        </div>
+        <div id="gameInfo">
+             <h3>Game Status</h3>
+             <div id="timer">Time Left: 03:00</div>
+             <div id="timerBarContainer"> <div id="timerBar"></div> </div>
+             <div id="score">Score: 0</div>
+        </div>
+        <div id="controlsInfo">
+            <h3>Controls</h3>
+            <div>⬅️ / ➡️: Rotate Jib</div>
+            <div>⬆️ / ⬇️: Move Trolley</div>
+            <div>X / Z: Lower / Raise Hook</div>
+            <div>Spacebar: Grab / Release Cargo</div>
+        </div>
+        <div id="highScoresContainer">
+             <h3>High Scores</h3>
+             <ol id="highScoresList"></ol>
+        </div>
+        <button id="startButton">Start Game</button>
+    </div>
+    <div id="gameOverMessage">
+        Game Over!
+        <span id="finalScore">Score: 0</span>
+    </div>
+
+    <canvas id="craneCanvas"></canvas>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script type="module">
+        // --- Basic Setup & State Variables ---
+        let scene, camera, renderer;
+        let ground, craneBase, craneTower, craneJibGroup;
+        let trolley, cable, hook, skySphere;
+        let birds = [];
+        let cargo = [];
+        const cargoToLoad = 5;
+        const loadingZone = { x: 15, z: 0, size: 10 };
+        const unloadingZone = { x: -15, z: 0, size: 10 };
+        const CARGO_HEIGHT = 1.5;
+        const HOOK_HEIGHT = 1.2;
+        const GAME_DURATION = 180;
+        const craneTypes = {
+            standard: { color: 0xFFD700, jibThickness: 1, towerWidth: 1.5, trolleySpeed: 0.1, hookSpeed: 0.05, design: 'standard' },
+            heavy: { color: 0xDC143C, jibThickness: 2.0, towerWidth: 2.4, trolleySpeed: 0.08, hookSpeed: 0.04, design: 'heavy' },
+            subsea: { color: 0xADD8E6, secondaryColor: 0xFFFFFF, jibThickness: 0.3, towerWidth: 1.8, trolleySpeed: 0.12, hookSpeed: 0.07, design: 'subsea' }
+        };
+        let selectedCraneType = 'standard';
+        let score = 0, timeLeft = GAME_DURATION, timerInterval = null, gameState = 'idle';
+        let highScores = [], keysPressed = {}, attachedCargo = null;
+        let hookHeightTarget = 5;
+        const hookMinHeight = 1.0;
+        const hookMaxHeight = 20.0;
+        const trolleyMinPos = 2;
+        let trolleyMaxPos = 18;
+        const rotationSpeed = 0.01;
+        // UI elements references...
+        const uiTimer = document.getElementById('timer');
+        const uiTimerBar = document.getElementById('timerBar');
+        const uiScore = document.getElementById('score');
+        const uiHighScoresList = document.getElementById('highScoresList');
+        const startButton = document.getElementById('startButton');
+        const gameOverMessage = document.getElementById('gameOverMessage');
+        const finalScoreDisplay = document.getElementById('finalScore');
+        const craneSelect = document.getElementById('craneSelect');
+        let animationFrameId = null;
+        const grabRadius = 1.8;
+        const tempVector = new THREE.Vector3();
+        const clock = new THREE.Clock();
+
+        // --- Physics simulation parameters ---
+        // Bounce
+        const bounceDecay = 5;
+        const bounceFrequency = 15;
+        const bounceDuration = 1.0;
+        const bounceThresholdHeight = 2.0;
+        // Swing (Pendulum)
+        const swingSpringConstant = 80.0; // Stiffness of the pendulum return force
+        const swingDampingFactor = 5.0;  // How quickly the swing reduces
+        const swingAccelerationFactor = 50.0; // How much crane movement affects swing
+        const maxSwingOffset = 1.5;      // Max horizontal displacement of the hook
+
+        // Pendulum state variables
+        let hookOffset = new THREE.Vector2(0, 0); // Local XZ offset of the hook from center
+        let hookVelocity = new THREE.Vector2(0, 0); // Local XZ velocity of the hook offset
+        let prevTrolleyWorldPos = new THREE.Vector3(); // To calculate trolley acceleration
+
+        // --- Initialization ---
+        function init() {
+            console.log("Crane Simulator Log: Initializing...");
+            try {
+                // ... (Scene, Camera, Renderer, Lighting setup - same as v5.1) ...
+                scene = new THREE.Scene();
+                camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                camera.position.set(0, 15, 35); camera.lookAt(0, 5, 0);
+                const canvas = document.getElementById('craneCanvas');
+                if (!canvas) throw new Error("Canvas element not found!");
+                renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.shadowMap.enabled = true;
+                renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.0;
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.7); scene.add(ambientLight);
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9);
+                directionalLight.position.set(15, 25, 15); directionalLight.castShadow = true;
+                directionalLight.shadow.mapSize.width = 1024; directionalLight.shadow.mapSize.height = 1024;
+                directionalLight.shadow.camera.near = 0.5; directionalLight.shadow.camera.far = 100;
+                directionalLight.shadow.camera.left = -40; directionalLight.shadow.camera.right = 40;
+                directionalLight.shadow.camera.top = 40; directionalLight.shadow.camera.bottom = -40;
+                scene.add(directionalLight);
+
+                createGradientSky();
+                createGroundTexture();
+                createZoneMarker(loadingZone.x, loadingZone.z, loadingZone.size, 0x00ff00);
+                createZoneMarker(unloadingZone.x, unloadingZone.z, unloadingZone.size, 0xffff00);
+                buildCrane(selectedCraneType);
+                createCargo();
+                createBirds(15);
+                loadHighScores();
+                updateHighScoresDisplay();
+
+                // Event Listeners... (same as v5.1)
+                window.addEventListener('resize', onWindowResize, false);
+                document.addEventListener('keydown', onKeyDown);
+                document.addEventListener('keyup', onKeyUp);
+                startButton.addEventListener('click', () => { console.log("Crane Simulator Log: Start button clicked!"); startGame(); });
+                craneSelect.addEventListener('change', (event) => { if (gameState === 'idle') { selectedCraneType = event.target.value; buildCrane(selectedCraneType); } });
+
+                updateTimerDisplay(); updateScoreDisplay();
+
+                // Initialize previous trolley position for swing calculation
+                if(trolley) trolley.getWorldPosition(prevTrolleyWorldPos);
+
+                console.log("Crane Simulator Log: Initialization complete. Starting animation loop.");
+                animate();
+
+            } catch (error) { console.error("Crane Simulator Error during Initialization:", error); /* ... error display ... */ }
+        }
+
+         function createZoneMarker(x, z, size, color) { /* ... same ... */
+             const zoneGeometry = new THREE.RingGeometry(size / 2 - 0.2, size / 2, 32);
+             const zoneMaterial = new THREE.MeshBasicMaterial({ color: color, side: THREE.DoubleSide });
+             const zoneMarker = new THREE.Mesh(zoneGeometry, zoneMaterial);
+             zoneMarker.position.set(x, 0.05, z); zoneMarker.rotation.x = -Math.PI / 2;
+             scene.add(zoneMarker);
+         }
+
+        function createGroundTexture() { /* ... same ... */
+            console.log("Crane Simulator Log: Creating ground texture...");
+            const canvasSize = 128; const textureCanvas = document.createElement('canvas');
+            textureCanvas.width = canvasSize; textureCanvas.height = canvasSize;
+            const context = textureCanvas.getContext('2d');
+            context.fillStyle = '#555555'; context.fillRect(0, 0, canvasSize, canvasSize);
+            context.strokeStyle = '#666666'; context.lineWidth = 2;
+            const step = canvasSize / 8;
+            for (let i = step; i < canvasSize; i += step) {
+                context.beginPath(); context.moveTo(i, 0); context.lineTo(i, canvasSize); context.stroke();
+                context.beginPath(); context.moveTo(0, i); context.lineTo(canvasSize, i); context.stroke();
+            }
+            const groundTexture = new THREE.CanvasTexture(textureCanvas);
+            groundTexture.wrapS = THREE.RepeatWrapping; groundTexture.wrapT = THREE.RepeatWrapping;
+            groundTexture.repeat.set(40, 40);
+            const groundGeometry = new THREE.PlaneGeometry(100, 100);
+            const groundMaterial = new THREE.MeshStandardMaterial({ map: groundTexture, side: THREE.DoubleSide, roughness: 0.8, metalness: 0.2 });
+            ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+            scene.add(ground);
+            console.log("Crane Simulator Log: Ground with texture added.");
+         }
+
+        function createGradientSky() { /* ... same ... */
+            console.log("Crane Simulator Log: Creating gradient sky...");
+            const vertexShader = `varying vec3 vWorldPosition; void main() { vec4 worldPosition = modelMatrix * vec4( position, 1.0 ); vWorldPosition = worldPosition.xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 ); }`;
+            const fragmentShader = `uniform vec3 topColor; uniform vec3 bottomColor; uniform float offset; uniform float exponent; varying vec3 vWorldPosition; void main() { float h = normalize( vWorldPosition + offset ).y; gl_FragColor = vec4( mix( bottomColor, topColor, max( pow( max( h , 0.0), exponent ), 0.0 ) ), 1.0 ); }`;
+            const uniforms = { topColor: { value: new THREE.Color(0x0077ff) }, bottomColor: { value: new THREE.Color(0xe0f0ff) }, offset: { value: 0 }, exponent: { value: 0.6 } };
+            const skyGeo = new THREE.SphereGeometry(500, 32, 15);
+            const skyMat = new THREE.ShaderMaterial({ uniforms: uniforms, vertexShader: vertexShader, fragmentShader: fragmentShader, side: THREE.BackSide });
+            skySphere = new THREE.Mesh(skyGeo, skyMat);
+            scene.add(skySphere);
+            console.log("Crane Simulator Log: Gradient sky added.");
+         }
+
+        // --- Crane Building ---
+        function buildCrane(typeKey) { /* ... same as v4.1 ... */
+            console.log(`Crane Simulator Log: Building crane type: ${typeKey}...`);
+            try {
+                if (craneBase) { scene.remove(craneBase); } // Removes base and all children
+
+                const type = craneTypes[typeKey];
+                if (!type) throw new Error(`Invalid crane type key: ${typeKey}`);
+                const craneMaterial = new THREE.MeshStandardMaterial({ color: type.color, roughness: 0.4, metalness: 0.3 });
+                const secondaryMaterial = type.secondaryColor ? new THREE.MeshStandardMaterial({ color: type.secondaryColor, roughness: 0.4, metalness: 0.3 }) : craneMaterial;
+                const detailMaterial = new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.5, metalness: 0.2 });
+
+                const towerHeight = 15; const jibLength = 20; trolleyMaxPos = jibLength - 2;
+
+                // Base
+                const baseHeight = 1; const baseRadius = (type.design === 'heavy') ? 3.0 : 2.2;
+                const baseGeometry = new THREE.CylinderGeometry(baseRadius, baseRadius, baseHeight, 32);
+                const baseMaterial = (type.design === 'subsea') ? secondaryMaterial : craneMaterial;
+                craneBase = new THREE.Mesh(baseGeometry, baseMaterial);
+                craneBase.position.y = baseHeight / 2; craneBase.castShadow = true; scene.add(craneBase);
+
+                // Tower
+                let towerGeometry; const towerWidth = type.towerWidth;
+                if (type.design === 'heavy') { towerGeometry = new THREE.BoxGeometry(towerWidth, towerHeight, towerWidth * 1.3); }
+                else if (type.design === 'subsea') { towerGeometry = new THREE.BoxGeometry(towerWidth * 0.9, towerHeight, towerWidth * 0.9); }
+                else { towerGeometry = new THREE.BoxGeometry(towerWidth, towerHeight, towerWidth); }
+                craneTower = new THREE.Mesh(towerGeometry, craneMaterial);
+                craneTower.position.y = towerHeight / 2 + baseHeight / 2; craneTower.castShadow = true; craneBase.add(craneTower);
+
+                // Cabin
+                if (type.design === 'standard' || type.design === 'heavy') {
+                    const cabin = new THREE.Mesh(new THREE.BoxGeometry(2, 1.8, 2.2), detailMaterial);
+                    cabin.position.set(0, towerHeight * 0.45, towerWidth * 0.6); cabin.castShadow = true; craneTower.add(cabin);
+                }
+
+                // Jib Group Pivot
+                craneJibGroup = new THREE.Group(); const jibPivotHeight = towerHeight * 0.45;
+                craneJibGroup.position.set(0, jibPivotHeight, 0); craneTower.add(craneJibGroup);
+
+                 // Machinery Housing / Counterweights
+                 if (type.design === 'heavy') {
+                     const machineryHouse = new THREE.Mesh(new THREE.BoxGeometry(towerWidth * 0.8, 4, 3.5), detailMaterial);
+                     machineryHouse.position.set(0, 0, -towerWidth * 0.4); machineryHouse.castShadow = true; craneJibGroup.add(machineryHouse);
+                     const weight = new THREE.Mesh(new THREE.BoxGeometry(towerWidth * 1.1, 2.5, 2.8), detailMaterial);
+                     weight.position.set(0, -3, -towerWidth * 0.4); weight.castShadow = true; craneJibGroup.add(weight);
+                 } else if (type.design === 'subsea') {
+                     const winchHouse = new THREE.Mesh(new THREE.BoxGeometry(3, 3.5, 3), secondaryMaterial);
+                     winchHouse.position.set(-1.5, 0.5, 0); winchHouse.castShadow = true; craneJibGroup.add(winchHouse);
+                 }
+
+                // Jib Parts
+                let jibTipGroup = new THREE.Group();
+                if (type.design === 'subsea') {
+                    const numSegments = 5; const segmentLength = jibLength / numSegments;
+                    const latticeColor = craneMaterial; const latticeDetailColor = secondaryMaterial;
+                    for (let i = 0; i < numSegments; i++) {
+                        const segmentGroup = new THREE.Group(); segmentGroup.position.x = i * segmentLength;
+                        const barGeo = new THREE.BoxGeometry(segmentLength, type.jibThickness, type.jibThickness);
+                        const topBar = new THREE.Mesh(barGeo, latticeColor); topBar.position.set(segmentLength / 2, 0.5, 0);
+                        const bottomBar = new THREE.Mesh(barGeo, latticeColor); bottomBar.position.set(segmentLength / 2, -0.5, 0);
+                        const crossGeo = new THREE.BoxGeometry(segmentLength * 1.2, type.jibThickness * 0.8, type.jibThickness * 0.8);
+                        const cross1 = new THREE.Mesh(crossGeo, latticeDetailColor); cross1.position.set(segmentLength / 2, 0, 0.3); cross1.rotation.z = Math.PI / 6;
+                        const cross2 = new THREE.Mesh(crossGeo, latticeDetailColor); cross2.position.set(segmentLength / 2, 0, -0.3); cross2.rotation.z = -Math.PI / 6;
+                        segmentGroup.add(topBar); segmentGroup.add(bottomBar); segmentGroup.add(cross1); segmentGroup.add(cross2);
+                        segmentGroup.castShadow = true; craneJibGroup.add(segmentGroup);
+                    }
+                     trolleyMaxPos = jibLength - 1; jibTipGroup.position.x = jibLength;
+                } else {
+                     const singleJibGeo = new THREE.BoxGeometry(jibLength, type.jibThickness, type.jibThickness);
+                     const singleJib = new THREE.Mesh(singleJibGeo, craneMaterial);
+                     singleJib.position.set(jibLength / 2, 0, 0); singleJib.castShadow = true; craneJibGroup.add(singleJib);
+                     trolleyMaxPos = jibLength - 2; jibTipGroup.position.x = jibLength;
+                     if (type.design === 'heavy') {
+                         const tipBlock = new THREE.Mesh(new THREE.BoxGeometry(1.5, type.jibThickness * 1.2, type.jibThickness * 1.2), detailMaterial);
+                         tipBlock.position.set(-0.75, 0, 0); tipBlock.castShadow = true; jibTipGroup.add(tipBlock);
+                     }
+                }
+                craneJibGroup.add(jibTipGroup);
+
+                // Trolley
+                const trolleyMaterial = (type.design === 'subsea') ? secondaryMaterial : detailMaterial;
+                trolley = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 0.8), trolleyMaterial);
+                const trolleyYOffset = (type.design === 'subsea') ? -0.8 : (-type.jibThickness / 2 - 0.5);
+                trolley.position.set(trolleyMinPos, trolleyYOffset, 0); trolley.castShadow = true; craneJibGroup.add(trolley);
+
+                // Cable & Hook
+                const cableMaterial = new THREE.LineBasicMaterial({ color: 0x111111, linewidth: 2 });
+                const points = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, -hookHeightTarget + 1, 0)]; // Points relative to trolley
+                const cableGeometry = new THREE.BufferGeometry().setFromPoints(points);
+                cable = new THREE.Line(cableGeometry, cableMaterial); trolley.add(cable);
+
+                hook = new THREE.Mesh(new THREE.BoxGeometry(0.6, HOOK_HEIGHT, 0.6), new THREE.MeshStandardMaterial({ color: 0xff0000, roughness: 0.3, metalness: 0.1 }));
+                hook.castShadow = true; trolley.add(hook); // Add hook as child of trolley
+
+                updateHookPosition(0); // Initial position update
+                // Reset pendulum state when building crane
+                hookOffset.set(0, 0);
+                hookVelocity.set(0, 0);
+                if(trolley) trolley.getWorldPosition(prevTrolleyWorldPos); // Initialize prev pos
+
+                console.log(`Crane Simulator Log: Finished building crane type: ${typeKey}.`);
+
+            } catch (error) {
+                 console.error(`Crane Simulator Error during buildCrane(${typeKey}):`, error);
+                 // ... (error handling)
+            }
+        }
+
+
+        function createCargo() { /* ... same ... */
+             console.log("Crane Simulator Log: Creating cargo...");
+             const cargoGeometry = new THREE.BoxGeometry(1.5, CARGO_HEIGHT, 1.5);
+             const cargoMaterial = new THREE.MeshStandardMaterial({ color: 0x006400, roughness: 0.6 });
+             cargo.forEach(c => { if (c.parent) c.parent.remove(c); scene.remove(c); });
+             cargo = [];
+             for (let i = 0; i < cargoToLoad; i++) {
+                 const item = new THREE.Mesh(cargoGeometry.clone(), cargoMaterial.clone());
+                 repositionCargoInLoadingZone(item);
+                 item.castShadow = true; item.receiveShadow = true;
+                 item.userData = { grabbable: true, loaded: true, uniqueId: `cargo_${i}`, isBouncing: false, bounceStartTime: 0, bounceStartY: CARGO_HEIGHT / 2, initialBounceAmplitude: 0 };
+                 scene.add(item); cargo.push(item);
+             }
+             console.log(`Crane Simulator Log: Created ${cargo.length} cargo items.`);
+         }
+        function repositionCargoInLoadingZone(cargoItem) { /* ... same ... */
+            const angle = Math.random() * Math.PI * 2;
+            const radius = (loadingZone.size / 2 - 1) * Math.random();
+            cargoItem.position.set( loadingZone.x + Math.cos(angle) * radius, CARGO_HEIGHT / 2, loadingZone.z + Math.sin(angle) * radius);
+             cargoItem.rotation.set(0, 0, 0);
+             cargoItem.userData.isBouncing = false;
+             cargoItem.userData.grabbable = true;
+             cargoItem.userData.loaded = true;
+             if (!cargoItem.parent) { scene.add(cargoItem); }
+        }
+        function createBirds(count) { /* ... same as v4.8 ... */
+            console.log("Crane Simulator Log: Creating birds...");
+            const birdGeometry = new THREE.ConeGeometry(0.2, 0.8, 8);
+            birdGeometry.rotateX(Math.PI / 2); birdGeometry.scale(1, 0.3, 1);
+            const birdMaterial = new THREE.MeshBasicMaterial({ color: 0x111111 });
+            const xRange = 150; const zRange = 100;
+            for (let i = 0; i < count; i++) {
+                const bird = new THREE.Mesh(birdGeometry.clone(), birdMaterial);
+                bird.position.set( (Math.random() - 0.5) * xRange, Math.random() * 20 + 15, (Math.random() - 0.5) * zRange - 50 );
+                const direction = new THREE.Vector3( (Math.random() > 0.5 ? 1 : -1), Math.random() * 0.1 - 0.05, Math.random() * 0.2 - 0.1 );
+                direction.normalize();
+                bird.userData = { speed: Math.random() * 0.1 + 0.05, phase: Math.random() * Math.PI * 2, direction: direction, xRange: xRange, zRange: zRange };
+                scene.add(bird); birds.push(bird);
+            }
+            console.log(`Crane Simulator Log: Created ${birds.length} birds.`);
+         }
+
+        // --- Game Logic ---
+         function startGame() { /* ... same ... */
+            console.log("Crane Simulator Log: startGame function entered.");
+            if (gameState === 'playing') { console.log("Crane Simulator Log: Game already playing, exiting startGame."); return; }
+            score = 0; timeLeft = GAME_DURATION; gameState = 'playing'; attachedCargo = null;
+            gameOverMessage.style.display = 'none'; startButton.disabled = true; craneSelect.disabled = true;
+            startButton.textContent = 'Restart Game';
+            updateScoreDisplay(); updateTimerDisplay();
+            trolley.position.x = trolleyMinPos; hookHeightTarget = 5;
+            // Reset pendulum state on start
+            hookOffset.set(0, 0); hookVelocity.set(0, 0);
+            if(trolley) trolley.getWorldPosition(prevTrolleyWorldPos);
+            updateHookPosition(clock.getElapsedTime()); // Pass time
+            console.log("Crane Simulator Log: Calling createCargo from startGame...");
+             try { createCargo(); } catch (error) {
+                 console.error("Crane Simulator Error during createCargo in startGame:", error);
+                 gameState = 'idle'; startButton.disabled = false; craneSelect.disabled = false; return;
+             }
+            console.log("Crane Simulator Log: Setting up timer interval...");
+             clearInterval(timerInterval);
+             timerInterval = setInterval(() => {
+                 if (gameState !== 'playing') { clearInterval(timerInterval); return; }
+                 timeLeft--;
+                 updateTimerDisplay();
+                 if (timeLeft <= 0) {
+                     timeLeft = 0; updateTimerDisplay(); endGame();
+                 }
+            }, 1000);
+             console.log("Crane Simulator Log: startGame function finished.");
+         }
+        function endGame() { /* ... same ... */
+             console.log("Crane Simulator Log: Ending game...");
+             gameState = 'gameOver'; clearInterval(timerInterval);
+             if (attachedCargo) { releaseCargo(true); }
+             finalScoreDisplay.textContent = `Score: ${score}`; gameOverMessage.style.display = 'block';
+             checkAndSaveHighScore(score); updateHighScoresDisplay();
+             startButton.disabled = false; craneSelect.disabled = false;
+         }
+        function updateScoreDisplay() { /* ... same ... */
+            if(uiScore) uiScore.textContent = `Score: ${score}`;
+        }
+        function updateTimerDisplay() { /* ... same as v5.0 ... */
+            if(uiTimer) { const minutes = Math.floor(timeLeft / 60); const seconds = timeLeft % 60; uiTimer.textContent = `Time Left: ${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`; }
+            if (uiTimerBar) { const percentage = Math.max(0, (timeLeft / GAME_DURATION) * 100); uiTimerBar.style.width = percentage + '%'; if (percentage <= 25) { uiTimerBar.style.backgroundColor = '#DC143C'; } else if (percentage <= 50) { uiTimerBar.style.backgroundColor = '#FFD700'; } else { uiTimerBar.style.backgroundColor = '#4CAF50'; } }
+         }
+
+        // --- High Score Logic ---
+        function loadHighScores() { /* ... same ... */
+             const storedScores = localStorage.getItem('craneHighScoresV5_2'); // Use new key
+             highScores = storedScores ? JSON.parse(storedScores) : []; highScores.sort((a, b) => b - a);
+         }
+        function checkAndSaveHighScore(currentScore) { /* ... same ... */
+             highScores.push(currentScore); highScores.sort((a, b) => b - a); highScores = highScores.slice(0, 5);
+             localStorage.setItem('craneHighScoresV5_2', JSON.stringify(highScores));
+         }
+        function updateHighScoresDisplay() { /* ... same ... */
+            if(uiHighScoresList) { uiHighScoresList.innerHTML = ''; if (highScores.length === 0) { uiHighScoresList.innerHTML = '<li>No scores yet!</li>'; } else { highScores.forEach((score, index) => { const li = document.createElement('li'); li.textContent = `${index + 1}. ${score}`; uiHighScoresList.appendChild(li); }); } }
+         }
+
+        // --- Controls and Movement ---
+        function onKeyDown(event) { /* ... same ... */
+            const key = event.key.toLowerCase();
+            if (gameState !== 'playing' && key !== ' ') return;
+            keysPressed[key] = true;
+            if (key === ' ') { event.preventDefault(); toggleGrabRelease(); }
+            if (gameState === 'playing' && ['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'z', 'x'].includes(key)) { event.preventDefault(); }
+         }
+        function onKeyUp(event) { keysPressed[event.key.toLowerCase()] = false; }
+        function updateCraneMovement() { /* ... same as v4.9 ... */
+             if (gameState !== 'playing') return;
+             const currentCraneProps = craneTypes[selectedCraneType];
+             if (keysPressed['arrowleft']) { craneBase.rotation.y += rotationSpeed; }
+             if (keysPressed['arrowright']) { craneBase.rotation.y -= rotationSpeed; }
+             if (keysPressed['arrowup']) { trolley.position.x += currentCraneProps.trolleySpeed; }
+             if (keysPressed['arrowdown']) { trolley.position.x -= currentCraneProps.trolleySpeed; }
+             trolley.position.x = Math.max(trolleyMinPos, Math.min(trolleyMaxPos, trolley.position.x));
+             if (keysPressed['x']) { hookHeightTarget += currentCraneProps.hookSpeed * 10; } // Lower
+             if (keysPressed['z']) { hookHeightTarget -= currentCraneProps.hookSpeed * 10; } // Raise
+             hookHeightTarget = Math.max(hookMinHeight, Math.min(hookMaxHeight, hookHeightTarget));
+             if (trolley && hook) {
+                 trolley.getWorldPosition(tempVector);
+                 const maxTargetForGround = tempVector.y - (HOOK_HEIGHT / 2) - 0.05;
+                 hookHeightTarget = Math.min(hookHeightTarget, maxTargetForGround);
+                 hookHeightTarget = Math.max(hookMinHeight, hookHeightTarget);
+             }
+             // updateHookPosition is called in animate loop now
+         }
+
+        // --- updateHookPosition (Uses Pendulum Offset) ---
+        function updateHookPosition() { // Time argument removed, uses global offset
+             if (!hook || !cable) return;
+
+             // Base vertical position
+             hook.position.y = -hookHeightTarget + (HOOK_HEIGHT / 2);
+
+             // Apply pendulum offset for X and Z
+             hook.position.x = hookOffset.x;
+             hook.position.z = hookOffset.y; // Using Vector2's y for Z axis offset
+
+             // Update cable geometry endpoint to match hook's final local position
+             const cablePoints = cable.geometry.attributes.position.array;
+             cablePoints[3] = hook.position.x;
+             cablePoints[4] = hook.position.y + (HOOK_HEIGHT / 2);
+             cablePoints[5] = hook.position.z;
+             cable.geometry.attributes.position.needsUpdate = true;
+         }
+
+        // --- Grab/Release Logic ---
+        function toggleGrabRelease() {
+             if (attachedCargo) { releaseCargo(); }
+             else { tryGrabCargo(); }
+         }
+
+        function tryGrabCargo() { /* ... same as v5.0 ... */
+            if (!hook) return;
+            const hookWorldPosition = new THREE.Vector3();
+            hook.getWorldPosition(hookWorldPosition);
+             for (const item of cargo) {
+                 if (item.parent === scene && item.userData.grabbable) {
+                     const distance = hookWorldPosition.distanceTo(item.position);
+                     const hookBottomY = hookWorldPosition.y - (HOOK_HEIGHT / 2);
+                     const cargoTopY = item.position.y + (CARGO_HEIGHT / 2);
+                     const heightMargin = 0.5;
+                     console.log(`Crane Log: Try Grab - Dist: ${distance.toFixed(2)}, Radius: ${grabRadius}, HookBottomY: ${hookBottomY.toFixed(2)}, CargoTopY+Margin: ${(cargoTopY + heightMargin).toFixed(2)}`);
+                     if (distance < grabRadius && hookBottomY < cargoTopY + heightMargin) {
+                         console.log("Crane Simulator Log: GRABBING CARGO (Spacebar):", item.userData.uniqueId);
+                         attachedCargo = item;
+                         item.userData.grabbable = false;
+                         hook.add(attachedCargo); // Attach to hook
+                         attachedCargo.position.set(0, -(HOOK_HEIGHT / 2) - (CARGO_HEIGHT / 2) - 0.1, 0); // Set local position below hook
+                         attachedCargo.rotation.set(0, 0, 0);
+                         // Reset pendulum when grabbing to avoid large initial swing
+                         hookOffset.set(0, 0);
+                         hookVelocity.set(0, 0);
+                         break;
+                     }
+                 }
+             }
+         }
+
+        function releaseCargo(forceOutside = false) { /* ... same as v5.1 ... */
+             if (!attachedCargo) return;
+             console.log("Crane Simulator Log: Releasing cargo:", attachedCargo.userData.uniqueId);
+
+             attachedCargo.getWorldPosition(tempVector);
+             const releaseHeight = tempVector.y;
+             hook.remove(attachedCargo);
+             scene.add(attachedCargo);
+             attachedCargo.position.set(tempVector.x, CARGO_HEIGHT / 2, tempVector.z);
+             attachedCargo.rotation.set(0, 0, 0);
+
+             const dx = attachedCargo.position.x - unloadingZone.x;
+             const dz = attachedCargo.position.z - unloadingZone.z;
+             const distanceToZoneCenter = Math.sqrt(dx * dx + dz * dz);
+
+             if (!forceOutside && distanceToZoneCenter < unloadingZone.size / 2) {
+                 console.log("Cargo unloaded successfully in zone!");
+                 score += 100; updateScoreDisplay();
+                 repositionCargoInLoadingZone(attachedCargo);
+             } else {
+                 if (forceOutside) console.log("Cargo released automatically (game over).");
+                 else console.log("Cargo released outside unloading zone.");
+                 attachedCargo.userData.grabbable = true;
+                 attachedCargo.userData.loaded = true;
+
+                 if (!forceOutside && releaseHeight > CARGO_HEIGHT / 2 + bounceThresholdHeight) {
+                     console.log("Initiating bounce...");
+                     attachedCargo.userData.isBouncing = true;
+                     attachedCargo.userData.bounceStartTime = clock.getElapsedTime();
+                     attachedCargo.userData.initialBounceAmplitude = Math.min(2.0, (releaseHeight - CARGO_HEIGHT / 2) * 0.2);
+                     attachedCargo.userData.bounceStartY = CARGO_HEIGHT / 2;
+                     attachedCargo.position.y = attachedCargo.userData.bounceStartY;
+                 } else {
+                     attachedCargo.position.y = CARGO_HEIGHT / 2;
+                     attachedCargo.userData.isBouncing = false;
+                 }
+             }
+             attachedCargo = null;
+         }
+
+         function updateBounceAnimation(item) { /* ... same as v5.1 ... */
+             const elapsedTime = clock.getElapsedTime() - item.userData.bounceStartTime;
+             const initialAmplitude = item.userData.initialBounceAmplitude;
+             if (elapsedTime > bounceDuration) {
+                 item.position.y = item.userData.bounceStartY; item.userData.isBouncing = false;
+                 // console.log("Bounce finished for", item.userData.uniqueId); // Reduce logging noise
+                 return;
+             }
+             const amplitude = initialAmplitude * Math.exp(-bounceDecay * elapsedTime) * Math.abs(Math.cos(bounceFrequency * elapsedTime));
+             item.position.y = item.userData.bounceStartY + amplitude;
+         }
+
+        // --- Pendulum Simulation Logic ---
+        const currentTrolleyWorldPos = new THREE.Vector3();
+        const trolleyAcceleration = new THREE.Vector3();
+        const localAcceleration = new THREE.Vector2(); // For hook's local XZ plane
+        const springForce = new THREE.Vector2();
+        const dampingForce = new THREE.Vector2();
+        const totalForce = new THREE.Vector2();
+
+        function updatePendulumPhysics(delta) {
+            if (!trolley || delta === 0) return; // Need trolley and time change
+
+            // 1. Calculate Trolley Acceleration (proxy for external force)
+            trolley.getWorldPosition(currentTrolleyWorldPos);
+            trolleyAcceleration.subVectors(currentTrolleyWorldPos, prevTrolleyWorldPos).divideScalar(delta);
+            prevTrolleyWorldPos.copy(currentTrolleyWorldPos); // Update previous position for next frame
+
+            // 2. Convert world acceleration to hook's local XZ plane (relative to trolley)
+            // We need the Jib's world rotation to transform the acceleration
+            const jibWorldQuaternion = new THREE.Quaternion();
+            craneJibGroup.getWorldQuaternion(jibWorldQuaternion);
+
+            // Inverse rotation to get acceleration relative to jib
+            const invJibQuaternion = jibWorldQuaternion.clone().invert();
+            const relativeAccel = trolleyAcceleration.clone().applyQuaternion(invJibQuaternion);
+
+            // We only care about X (along jib) and Z (sideways) relative components for XZ swing
+            localAcceleration.set(relativeAccel.x, relativeAccel.z);
+
+            // 3. Calculate Forces acting on the hook offset
+            // Spring force (pulls back to center)
+            springForce.copy(hookOffset).multiplyScalar(-swingSpringConstant);
+            // Damping force (opposes velocity)
+            dampingForce.copy(hookVelocity).multiplyScalar(-swingDampingFactor);
+            // External force from acceleration
+            const externalForce = localAcceleration.multiplyScalar(-swingAccelerationFactor); // Negative factor simulates inertia
+
+            // 4. Sum forces
+            totalForce.copy(springForce).add(dampingForce).add(externalForce);
+
+            // 5. Update Velocity (Integrate acceleration)
+            hookVelocity.add(totalForce.multiplyScalar(delta));
+
+            // 6. Update Offset (Integrate velocity)
+            hookOffset.add(hookVelocity.clone().multiplyScalar(delta));
+
+            // 7. Clamp Offset (Limit max swing)
+            hookOffset.clampLength(0, maxSwingOffset);
+        }
+
+
+        // --- Animation Loop ---
+        let lastLogTime = 0;
+
+        function animate(time) {
+            animationFrameId = requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const elapsedTime = clock.getElapsedTime();
+
+            try {
+                // Logging...
+                if (elapsedTime - lastLogTime > 5) { console.log("Crane Simulator Log: Animation loop running..."); lastLogTime = elapsedTime; }
+
+                // Animate Birds...
+                birds.forEach(bird => { /* ... same bird animation ... */
+                    bird.position.addScaledVector(bird.userData.direction, bird.userData.speed);
+                    bird.position.y += Math.sin(elapsedTime * bird.userData.speed * 5 + bird.userData.phase) * 0.02;
+                    const { xRange, zRange } = bird.userData; let resetPosition = false;
+                    if (bird.position.x > xRange / 2 || bird.position.x < -xRange / 2 || bird.position.z > 0 || bird.position.z < -zRange - 50) { resetPosition = true; }
+                    if (resetPosition) {
+                        bird.position.x = -Math.sign(bird.position.x) * xRange / 2;
+                        bird.position.y = Math.random() * 20 + 15;
+                        bird.position.z = (Math.random() - 0.5) * zRange - 50;
+                    }
+                });
+
+                // Update crane movement based on keys
+                if (gameState === 'playing') {
+                    updateCraneMovement(); // Includes ground collision check
+                }
+
+                 // --- Update Pendulum Physics ---
+                 if (gameState === 'playing' || hookVelocity.lengthSq() > 0.001) { // Keep simulating if still swinging
+                    updatePendulumPhysics(delta);
+                 }
+
+                 // Update hook position (applies pendulum offset)
+                 updateHookPosition(); // Removed time argument
+
+                 // Update bouncing cargo animations
+                 cargo.forEach(item => {
+                     if (item.userData.isBouncing) {
+                         updateBounceAnimation(item);
+                     }
+                 });
+
+                // Render the scene
+                if (renderer && scene && camera) { renderer.render(scene, camera); }
+                else { console.warn("Crane Simulator Warn: Renderer, scene, or camera missing..."); if (animationFrameId) cancelAnimationFrame(animationFrameId); }
+
+            } catch (error) {
+                console.error("Crane Simulator Error during Animation Loop:", error);
+                // ... (error handling) ...
+            }
+        }
+
+        // --- Utility ---
+        function onWindowResize() { /* ... same ... */
+            if (camera && renderer) {
+                camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                console.log("Crane Simulator Log: Window resized.");
+            }
+         }
+
+        // --- Start ---
+        document.addEventListener('DOMContentLoaded', () => { init(); });
+
+    </script>
+</body>
+</html>
